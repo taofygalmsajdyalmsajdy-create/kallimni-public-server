@@ -3,10 +3,18 @@ const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 
 const PORT = process.env.PORT || 3000;
-const clients = new Map();
+
+// اتصالات المستخدمين المسجلين
+const users = new Map();
+
+// دعم الغرف القديمة مؤقتًا
+const rooms = new Map();
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8"
+  });
+
   res.end("Kallimni public server is running");
 });
 
@@ -21,21 +29,38 @@ function send(socket, data) {
   }
 }
 
+function validId(value) {
+  return typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 128 &&
+    /^[a-zA-Z0-9_-]+$/.test(value);
+}
+
 function removeClient(socket) {
-  const room = socket.room;
+  if (socket.userId && users.has(socket.userId)) {
+    const set = users.get(socket.userId);
+    set.delete(socket);
 
-  if (room && clients.has(room)) {
-    clients.get(room).delete(socket);
-
-    if (clients.get(room).size === 0) {
-      clients.delete(room);
+    if (set.size === 0) {
+      users.delete(socket.userId);
     }
   }
 
+  if (socket.room && rooms.has(socket.room)) {
+    const set = rooms.get(socket.room);
+    set.delete(socket);
+
+    if (set.size === 0) {
+      rooms.delete(socket.room);
+    }
+  }
+
+  socket.userId = null;
   socket.room = null;
 }
 
 wss.on("connection", (socket) => {
+  socket.userId = null;
   socket.room = null;
   socket.username = "مستخدم";
 
@@ -57,6 +82,89 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    // تسجيل اتصال التطبيق بمعرّف المستخدم
+    if (data.type === "register") {
+      const userId = String(data.userId || "").trim();
+
+      if (!validId(userId)) {
+        send(socket, {
+          type: "error",
+          message: "معرّف المستخدم غير صالح"
+        });
+        return;
+      }
+
+      removeClient(socket);
+      socket.userId = userId;
+
+      if (!users.has(userId)) {
+        users.set(userId, new Set());
+      }
+
+      users.get(userId).add(socket);
+
+      send(socket, {
+        type: "registered",
+        userId,
+        message: "تم تسجيل الاتصال"
+      });
+
+      return;
+    }
+
+    // توجيه حزمة إلى مستخدم محدد
+    if (data.type === "send") {
+      if (!socket.userId) {
+        send(socket, {
+          type: "error",
+          message: "سجل المستخدم أولًا"
+        });
+        return;
+      }
+
+      const targetId = String(data.targetId || "").trim();
+      const packetData = data.data;
+
+      if (!validId(targetId) ||
+          typeof packetData !== "string" ||
+          packetData.length === 0 ||
+          Buffer.byteLength(packetData, "utf8") > 60000) {
+        send(socket, {
+          type: "error",
+          message: "بيانات الحزمة غير صالحة"
+        });
+        return;
+      }
+
+      const recipients = users.get(targetId);
+      let delivered = false;
+
+      if (recipients) {
+        for (const recipient of recipients) {
+          if (recipient.readyState === WebSocket.OPEN) {
+            send(recipient, {
+              type: "packet",
+              from: socket.userId,
+              data: packetData,
+              timestamp: Date.now()
+            });
+
+            delivered = true;
+          }
+        }
+      }
+
+      send(socket, {
+        type: "sent",
+        targetId,
+        delivered,
+        timestamp: Date.now()
+      });
+
+      return;
+    }
+
+    // دعم نظام الغرف القديم
     if (data.type === "join") {
       const room = String(data.room || "").trim();
       const username = String(data.username || "مستخدم").trim();
@@ -70,15 +178,14 @@ wss.on("connection", (socket) => {
       }
 
       removeClient(socket);
-
       socket.room = room;
       socket.username = username.slice(0, 40) || "مستخدم";
 
-      if (!clients.has(room)) {
-        clients.set(room, new Set());
+      if (!rooms.has(room)) {
+        rooms.set(room, new Set());
       }
 
-      clients.get(room).add(socket);
+      rooms.get(room).add(socket);
 
       send(socket, {
         type: "joined",
@@ -117,7 +224,7 @@ wss.on("connection", (socket) => {
         timestamp: Date.now()
       };
 
-      const roomClients = clients.get(socket.room);
+      const roomClients = rooms.get(socket.room);
 
       if (roomClients) {
         for (const client of roomClients) {
@@ -142,7 +249,6 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", () => removeClient(socket));
-
   socket.on("error", () => removeClient(socket));
 });
 
