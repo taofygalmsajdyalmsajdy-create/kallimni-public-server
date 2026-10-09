@@ -1,15 +1,16 @@
 {
-"name": "kallimni-public-server",
-"version": "1.0.0",
-"description": "Kallimni WebSocket messaging server",
-"main": "server.js",
-"scripts": {
-"start": "node server.js"
-},
-"engines": {
-"node": ">=20"
-},
-"dependencies": {
-"ws": "^8.18.0"
-}
+  "name": "kallimni-public-server",
+  "version": "1.1.0",
+  "description": "Kallimni WebSocket messaging server with PostgreSQL persistence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.16.3",
+    "ws": "^8.18.0"
+  }
 }
