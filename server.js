@@ -20,6 +20,10 @@ const pool = new Pool({
 const users = new Map();
 const rooms = new Map();
 
+/* =========================
+   HTTP HEALTH CHECK
+========================= */
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, {
     "Content-Type": "text/plain; charset=utf-8"
@@ -28,82 +32,90 @@ const server = http.createServer((req, res) => {
   res.end("Kallimni public server is running");
 });
 
+/* =========================
+   WEBSOCKET SERVER
+========================= */
+
 const wss = new WebSocketServer({
   server,
   maxPayload: 64 * 1024
 });
 
-function send(socket, data) {
-  if (socket.readyState !== WebSocket.OPEN) {
-    return false;
-  }
+/* =========================
+   GENERAL HELPERS
+========================= */
 
-  try {
+function send(socket, data) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(data));
-    return true;
-  } catch (error) {
-    console.error("WebSocket send error:", error.message);
-    return false;
   }
 }
 
 function validId(value) {
-  return typeof value === "string" &&
+  return (
+    typeof value === "string" &&
     value.length >= 1 &&
     value.length <= 128 &&
-    /^[a-zA-Z0-9_-]+$/.test(value);
+    /^[a-zA-Z0-9_-]+$/.test(value)
+  );
 }
 
 function removeClient(socket) {
-  if (socket.userId && users.has(socket.userId)) {
-    const set = users.get(socket.userId);
-    set.delete(socket);
+  const userId = socket.userId;
 
-    if (set.size === 0) {
-      users.delete(socket.userId);
+  if (userId && users.has(userId)) {
+    const sockets = users.get(userId);
+
+    sockets.delete(socket);
+
+    if (sockets.size === 0) {
+      users.delete(userId);
     }
+
+    console.log("Client removed from user:", userId);
   }
 
-  if (socket.room && rooms.has(socket.room)) {
-    const set = rooms.get(socket.room);
-    set.delete(socket);
+  for (const [roomId, members] of rooms.entries()) {
+    members.delete(socket);
 
-    if (set.size === 0) {
-      rooms.delete(socket.room);
+    if (members.size === 0) {
+      rooms.delete(roomId);
     }
   }
-
-  socket.userId = null;
-  socket.room = null;
 }
 
 function sendToUser(userId, packet) {
-  const recipients = users.get(userId);
-  let sent = false;
+  const sockets = users.get(userId);
 
-  if (!recipients) {
+  if (!sockets || sockets.size === 0) {
     return false;
   }
 
-  for (const recipient of recipients) {
-    if (recipient.readyState === WebSocket.OPEN) {
-      if (send(recipient, packet)) {
-        sent = true;
-      }
+  let delivered = false;
+
+  for (const socket of sockets) {
+    if (socket.readyState === WebSocket.OPEN) {
+      send(socket, packet);
+      delivered = true;
     }
   }
 
-  return sent;
+  return delivered;
 }
 
-// إنشاء جدول الرسائل الدائمة.
+/* =========================
+   DATABASE INITIALIZATION
+========================= */
+
 async function initializeDatabase() {
+  console.log("Initializing PostgreSQL...");
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pending_messages (
       message_id UUID PRIMARY KEY,
-      sender_id VARCHAR(128) NOT NULL,
-      target_id VARCHAR(128) NOT NULL,
-      packet_data TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      payload TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
@@ -117,65 +129,146 @@ async function initializeDatabase() {
   console.log("PostgreSQL initialized");
 }
 
-// إرسال الرسائل المحفوظة إلى المستخدم عند اتصاله.
+/* =========================
+   PENDING MESSAGE DELIVERY
+========================= */
+
 async function deliverPending(socket, userId) {
-  const result = await pool.query(
-    `SELECT message_id, sender_id, packet_data, created_at
-     FROM pending_messages
-     WHERE target_id = $1
-     ORDER BY created_at ASC
-     LIMIT 500`,
-    [userId]
-  );
+  try {
+    const result = await pool.query(
+      `
+      SELECT message_id, sender_id, target_id, payload, created_at
+      FROM pending_messages
+      WHERE target_id = $1
+      ORDER BY created_at ASC
+      LIMIT 500
+      `,
+      [userId]
+    );
 
-  for (const row of result.rows) {
-    if (socket.readyState !== WebSocket.OPEN) {
-      break;
+    console.log(
+      "Pending messages found:",
+      result.rows.length,
+      "for user:",
+      userId
+    );
+
+    for (const row of result.rows) {
+      if (socket.readyState !== WebSocket.OPEN) {
+        console.log(
+          "Socket closed during pending delivery:",
+          userId
+        );
+        return;
+      }
+
+      send(socket, {
+        type: "packet",
+        messageId: row.message_id,
+        senderId: row.sender_id,
+        targetId: row.target_id,
+        data: row.payload,
+        createdAt: row.created_at
+      });
     }
-
-    // تحقق أن الاتصال ما زال مسجلًا لهذا المستخدم.
-    if (socket.userId !== userId) {
-      break;
-    }
-
-    send(socket, {
-      type: "packet",
-      from: row.sender_id,
-      data: row.packet_data,
-      timestamp: new Date(row.created_at).getTime(),
-      messageId: row.message_id,
-      pending: true
-    });
+  } catch (error) {
+    console.error(
+      "Pending message delivery error:",
+      error.message
+    );
   }
 }
 
-wss.on("connection", (socket) => {
+/* =========================
+   WEBSOCKET CONNECTION
+========================= */
+
+wss.on("connection", (socket, request) => {
   socket.userId = null;
-  socket.room = null;
-  socket.username = "مستخدم";
+
+  console.log("================================");
+  console.log("WebSocket client connected");
+  console.log(
+    "Client address:",
+    request.socket.remoteAddress || "unknown"
+  );
+  console.log("================================");
 
   send(socket, {
     type: "connected",
     message: "اتصلت بخادم كلمني"
   });
 
+  /* =========================
+     INCOMING MESSAGES
+  ========================= */
+
   socket.on("message", async (raw) => {
     try {
-      const data = JSON.parse(raw.toString());
+      const text = raw.toString();
 
-      // تسجيل المستخدم.
+      console.log(
+        "WebSocket message received:",
+        text.length,
+        "bytes"
+      );
+
+      let data;
+
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        console.error(
+          "Invalid JSON received:",
+          error.message
+        );
+
+        send(socket, {
+          type: "error",
+          message: "Invalid JSON"
+        });
+
+        return;
+      }
+
+      if (!data || typeof data.type !== "string") {
+        send(socket, {
+          type: "error",
+          message: "Invalid message type"
+        });
+
+        return;
+      }
+
+      /* =========================
+         REGISTER USER
+      ========================= */
+
       if (data.type === "register") {
-        const userId = String(data.userId || "").trim();
+        const userId = data.userId;
+
+        console.log(
+          "Register request received:",
+          userId
+        );
 
         if (!validId(userId)) {
+          console.error(
+            "Registration rejected: invalid userId"
+          );
+
           send(socket, {
             type: "error",
-            message: "معرّف المستخدم غير صالح"
+            message: "Invalid userId"
           });
+
           return;
         }
 
+        /* Remove previous association for this socket. */
+
         removeClient(socket);
+
         socket.userId = userId;
 
         if (!users.has(userId)) {
@@ -186,249 +279,433 @@ wss.on("connection", (socket) => {
 
         send(socket, {
           type: "registered",
-          userId,
-          message: "تم تسجيل الاتصال"
+          userId: userId,
+          message: "تم تسجيل المستخدم بنجاح"
         });
 
-        try {
-          await deliverPending(socket, userId);
-        } catch (error) {
-          console.error("Pending delivery error:", error.message);
+        console.log(
+          "User registered successfully:",
+          userId
+        );
 
-          send(socket, {
-            type: "error",
-            message: "تعذر جلب الرسائل المحفوظة"
-          });
-        }
+        console.log(
+          "Active connections for user:",
+          users.get(userId).size
+        );
+
+        await deliverPending(socket, userId);
 
         return;
       }
 
-      // تأكيد استلام رسالة محفوظة.
-      // لا تُحذف الرسالة إلا إذا كان المستلم هو صاحب الاتصال.
+      /* =========================
+         REQUIRE REGISTRATION
+      ========================= */
+
+      if (!socket.userId) {
+        console.warn(
+          "Message rejected: user not registered"
+        );
+
+        send(socket, {
+          type: "error",
+          message: "User not registered"
+        });
+
+        return;
+      }
+
+      /* =========================
+         MESSAGE ACKNOWLEDGEMENT
+      ========================= */
+
       if (data.type === "ack") {
-        if (!socket.userId) {
+        const messageId = data.messageId;
+
+        if (
+          typeof messageId !== "string" ||
+          !/^[0-9a-fA-F-]{36}$/.test(messageId)
+        ) {
           send(socket, {
             type: "error",
-            message: "سجل المستخدم أولًا"
+            message: "Invalid messageId"
           });
+
           return;
         }
 
-        const messageId = String(data.messageId || "");
-
-        if (!/^[0-9a-fA-F-]{36}$/.test(messageId)) {
-          send(socket, {
-            type: "error",
-            message: "معرّف الرسالة غير صالح"
-          });
-          return;
-        }
-
-        await pool.query(
-          `DELETE FROM pending_messages
-           WHERE message_id = $1 AND target_id = $2`,
+        const result = await pool.query(
+          `
+          DELETE FROM pending_messages
+          WHERE message_id = $1
+            AND target_id = $2
+          `,
           [messageId, socket.userId]
         );
 
         send(socket, {
           type: "acknowledged",
-          messageId
+          messageId: messageId
         });
+
+        console.log(
+          "Message acknowledged:",
+          messageId,
+          "deleted:",
+          result.rowCount
+        );
 
         return;
       }
 
-      // إرسال رسالة إلى مستخدم.
+      /* =========================
+         SEND PRIVATE MESSAGE
+      ========================= */
+
       if (data.type === "send") {
-        if (!socket.userId) {
+        const targetId = data.targetId;
+        const payload = data.data;
+
+        console.log(
+          "Send request:",
+          socket.userId,
+          "->",
+          targetId
+        );
+
+        if (!validId(targetId)) {
           send(socket, {
             type: "error",
-            message: "سجل المستخدم أولًا"
+            message: "Invalid targetId"
           });
-          return;
-        }
 
-        const targetId = String(data.targetId || "").trim();
-        const packetData = data.data;
-
-        if (
-          !validId(targetId) ||
-          typeof packetData !== "string" ||
-          packetData.length === 0 ||
-          Buffer.byteLength(packetData, "utf8") > 60000
-        ) {
-          send(socket, {
-            type: "error",
-            message: "بيانات الحزمة غير صالحة"
-          });
           return;
         }
 
         if (targetId === socket.userId) {
           send(socket, {
             type: "error",
-            message: "لا يمكن إرسال الرسالة إلى نفسك"
+            message: "Cannot send message to yourself"
           });
+
+          return;
+        }
+
+        if (
+          typeof payload !== "string" ||
+          Buffer.byteLength(payload, "utf8") > 60000
+        ) {
+          send(socket, {
+            type: "error",
+            message: "Invalid or oversized payload"
+          });
+
           return;
         }
 
         const messageId = crypto.randomUUID();
-        const timestamp = Date.now();
 
-        // حفظ الرسالة أولًا؛ إذا فشل الحفظ لا نعلن نجاح الإرسال.
         await pool.query(
-          `INSERT INTO pending_messages
-           (message_id, sender_id, target_id, packet_data)
-           VALUES ($1, $2, $3, $4)`,
-          [messageId, socket.userId, targetId, packetData]
+          `
+          INSERT INTO pending_messages (
+            message_id,
+            sender_id,
+            target_id,
+            payload
+          )
+          VALUES ($1, $2, $3, $4)
+          `,
+          [
+            messageId,
+            socket.userId,
+            targetId,
+            payload
+          ]
         );
 
-        const delivered = sendToUser(targetId, {
-          type: "packet",
-          from: socket.userId,
-          data: packetData,
-          timestamp,
+        console.log(
+          "Message saved:",
           messageId,
-          pending: true
-        });
+          "target:",
+          targetId
+        );
+
+        const packet = {
+          type: "packet",
+          messageId: messageId,
+          senderId: socket.userId,
+          targetId: targetId,
+          data: payload,
+          createdAt: new Date().toISOString()
+        };
+
+        const delivered = sendToUser(
+          targetId,
+          packet
+        );
 
         send(socket, {
           type: "sent",
-          targetId,
-          messageId,
-          delivered,
-          timestamp
+          messageId: messageId,
+          targetId: targetId,
+          delivered: delivered
         });
+
+        console.log(
+          "Message processing complete:",
+          messageId,
+          "delivered live:",
+          delivered
+        );
 
         return;
       }
 
-      // دعم نظام الغرف القديم.
-      if (data.type === "join") {
-        const room = String(data.room || "").trim();
-        const username = String(data.username || "مستخدم").trim();
+      /* =========================
+         LEGACY ROOM JOIN
+      ========================= */
 
-        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(room)) {
+      if (data.type === "join") {
+        const roomId = data.roomId;
+
+        if (!validId(roomId)) {
           send(socket, {
             type: "error",
-            message: "اسم الغرفة غير صالح"
+            message: "Invalid roomId"
           });
+
           return;
         }
 
-        removeClient(socket);
-        socket.room = room;
-        socket.username = username.slice(0, 40) || "مستخدم";
-
-        if (!rooms.has(room)) {
-          rooms.set(room, new Set());
+        if (!rooms.has(roomId)) {
+          rooms.set(roomId, new Set());
         }
 
-        rooms.get(room).add(socket);
+        rooms.get(roomId).add(socket);
 
         send(socket, {
           type: "joined",
-          room,
-          username: socket.username,
-          message: "أنت الآن متصل بغرفة كلمني"
+          roomId: roomId
         });
+
+        console.log(
+          "User joined room:",
+          socket.userId,
+          roomId
+        );
 
         return;
       }
 
+      /* =========================
+         LEGACY ROOM MESSAGE
+      ========================= */
+
       if (data.type === "message") {
-        if (!socket.room) {
+        const roomId = data.roomId;
+        const payload = data.data;
+
+        if (!validId(roomId)) {
           send(socket, {
             type: "error",
-            message: "انضم إلى غرفة أولًا"
+            message: "Invalid roomId"
           });
+
           return;
         }
 
-        const messageText = String(data.text || "");
-
-        if (!messageText.trim() || messageText.length > 4000) {
+        if (
+          typeof payload !== "string" ||
+          Buffer.byteLength(payload, "utf8") > 60000
+        ) {
           send(socket, {
             type: "error",
-            message: "الرسالة فارغة أو طويلة جدًا"
+            message: "Invalid or oversized payload"
           });
+
+          return;
+        }
+
+        const members = rooms.get(roomId);
+
+        if (!members) {
+          send(socket, {
+            type: "error",
+            message: "Room not found"
+          });
+
           return;
         }
 
         const packet = {
           type: "message",
-          room: socket.room,
-          username: socket.username,
-          text: messageText,
-          timestamp: Date.now()
+          roomId: roomId,
+          senderId: socket.userId,
+          data: payload,
+          createdAt: new Date().toISOString()
         };
 
-        const roomClients = rooms.get(socket.room);
-
-        if (roomClients) {
-          for (const client of roomClients) {
-            if (client !== socket) {
-              send(client, packet);
-            }
+        for (const member of members) {
+          if (
+            member !== socket &&
+            member.readyState === WebSocket.OPEN
+          ) {
+            send(member, packet);
           }
         }
 
-        send(socket, {
-          type: "sent",
-          timestamp: packet.timestamp
-        });
+        console.log(
+          "Room message sent:",
+          roomId,
+          "from:",
+          socket.userId
+        );
 
         return;
       }
 
-      send(socket, {
-        type: "error",
-        message: "نوع الطلب غير معروف"
-      });
-    } catch (error) {
-      console.error("Message handler error:", error.message);
+      /* =========================
+         UNKNOWN MESSAGE TYPE
+      ========================= */
+
+      console.warn(
+        "Unknown message type:",
+        data.type
+      );
 
       send(socket, {
         type: "error",
-        message: "تعذر معالجة الطلب"
+        message: "Unknown message type"
+      });
+
+    } catch (error) {
+      console.error(
+        "Message handler error:",
+        error.stack || error.message
+      );
+
+      send(socket, {
+        type: "error",
+        message: "Internal server error"
       });
     }
   });
 
-  socket.on("close", () => removeClient(socket));
-  socket.on("error", () => removeClient(socket));
+  /* =========================
+     SOCKET CLOSE
+  ========================= */
+
+  socket.on("close", (code, reason) => {
+    console.log(
+      "WebSocket client disconnected:",
+      "code:",
+      code,
+      "reason:",
+      reason ? reason.toString() : ""
+    );
+
+    removeClient(socket);
+  });
+
+  /* =========================
+     SOCKET ERROR
+  ========================= */
+
+  socket.on("error", (error) => {
+    console.error(
+      "WebSocket client error:",
+      error.message
+    );
+
+    removeClient(socket);
+  });
 });
+
+/* =========================
+   WEBSOCKET SERVER ERRORS
+========================= */
+
+wss.on("error", (error) => {
+  console.error(
+    "WebSocket server error:",
+    error.stack || error.message
+  );
+});
+
+/* =========================
+   START SERVER
+========================= */
 
 async function start() {
   try {
     await initializeDatabase();
 
     server.listen(PORT, "0.0.0.0", () => {
-      console.log(`Kallimni server running on port ${PORT}`);
+      console.log(
+        `Kallimni server running on port ${PORT}`
+      );
     });
+
   } catch (error) {
-    console.error("Server startup failed:", error.message);
+    console.error(
+      "Server startup failed:",
+      error.stack || error.message
+    );
+
     process.exit(1);
   }
 }
 
-async function shutdown() {
-  console.log("Shutting down Kallimni server");
+/* =========================
+   GRACEFUL SHUTDOWN
+========================= */
 
-  wss.close();
+async function shutdown(signal) {
+  console.log(
+    "Received shutdown signal:",
+    signal
+  );
+
+  for (const socket of wss.clients) {
+    socket.close(1001, "Server shutting down");
+  }
+
   server.close(async () => {
     try {
       await pool.end();
-    } finally {
-      process.exit(0);
+
+      console.log(
+        "PostgreSQL connection pool closed"
+      );
+    } catch (error) {
+      console.error(
+        "Database shutdown error:",
+        error.message
+      );
     }
+
+    process.exit(0);
   });
 
-  setTimeout(() => process.exit(1), 10000).unref();
+  setTimeout(() => {
+    console.error(
+      "Shutdown timed out; forcing exit"
+    );
+
+    process.exit(1);
+  }, 10000).unref();
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT");
+});
+
+/* =========================
+   START
+========================= */
 
 start();
